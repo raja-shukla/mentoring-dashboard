@@ -9,11 +9,6 @@ from io import BytesIO
 # ============================================================
 st.set_page_config(page_title="Mentoring Visit Dashboard", layout="wide")
 
-# Your raw files have these exact columns (verified):
-# District: District Name, Employee Code, Employee Name, Role Name, Targeted Visits, Completed, Details
-# Block:    District Name, Block Name, Employee Code, Employee Name, Role Name, Targeted Visits, Completed, Details
-# Cluster:  District Name, Block Name, Cluster Name, Employee Code, Employee Name, Role Name, Targeted Visits, Completed, Details
-
 REQ_DIST = {"District Name", "Employee Code", "Employee Name", "Role Name", "Targeted Visits", "Completed"}
 REQ_BLOCK = {"District Name", "Block Name", "Employee Code", "Employee Name", "Role Name", "Targeted Visits", "Completed"}
 REQ_CLUSTER = {"District Name", "Block Name", "Cluster Name", "Employee Code", "Employee Name", "Role Name", "Targeted Visits", "Completed"}
@@ -23,7 +18,7 @@ BLOCK_ROLES = ["BRCC", "BAC"]
 CLUSTER_ROLES = ["CAC"]
 
 ROLE_CANON = {
-    "BRC": "BRCC",  # mapping if your block file uses BRC
+    "BRC": "BRCC",  # mapping if file uses BRC
     "BRCC": "BRCC",
     "BAC": "BAC",
     "CAC": "CAC",
@@ -40,19 +35,16 @@ def standardize(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
 
-    # Clean strings
     text_cols = ["District Name", "Block Name", "Cluster Name", "Employee Name", "Role Name", "Employee Code"]
     for c in text_cols:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
             df.loc[df[c].isin(["nan", "None", "NaN", ""]), c] = np.nan
 
-    # Numeric coercion
     for c in ["Targeted Visits", "Completed"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    # Canonical roles
     if "Role Name" in df.columns:
         df["Role Name"] = df["Role Name"].map(lambda x: ROLE_CANON.get(str(x).strip(), str(x).strip()))
 
@@ -67,14 +59,7 @@ def validate(df: pd.DataFrame, required: set, label: str):
 
 
 def mentor_100_flag(df: pd.DataFrame) -> pd.Series:
-    # A mentor counts as 100% if Completed >= Targeted and Targeted > 0
     return (df["Targeted Visits"] > 0) & (df["Completed"] >= df["Targeted Visits"])
-
-
-def safe_pct(numer, denom):
-    if denom <= 0:
-        return np.nan
-    return (numer / denom) * 100
 
 
 def style_pct_cols(df: pd.DataFrame, pct_cols: list[str]):
@@ -86,12 +71,8 @@ def style_pct_cols(df: pd.DataFrame, pct_cols: list[str]):
 
 
 def agg_role_wide(df: pd.DataFrame, group_cols: list[str], role: str) -> pd.DataFrame:
-    """
-    For state table: gives role Target/Completed/% by group_cols.
-    """
     d = df[df["Role Name"] == role].copy()
     if d.empty:
-        # return empty structure so merge doesn't break
         out_cols = group_cols + [f"{role} Target", f"{role} Completed", f"{role} %"]
         return pd.DataFrame(columns=out_cols)
 
@@ -137,6 +118,68 @@ def to_excel_download(sheets: dict[str, pd.DataFrame], filename: str):
         file_name=filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+
+def mentor_exception_table(df: pd.DataFrame, group_cols: list[str], title: str):
+    """
+    Mentor-level exception list for those NOT completing 100% target.
+    Enhancements:
+    - Adds Block Name and Cluster Name (when available)
+    - Removes Employee Code from display (still used for upstream metrics elsewhere)
+    - Heading uses ':' (no em dash)
+    - FIXED: prevents duplicate groupby columns (avoids 'cannot insert Block Name, already exists')
+    """
+    d = df.copy()
+
+    needed = set(group_cols) | {"Role Name", "Employee Name", "Targeted Visits", "Completed"}
+    missing = needed - set(d.columns)
+    if missing:
+        st.warning(f"Cannot build exception list; missing columns: {sorted(list(missing))}")
+        return None
+
+    # Only mentors with target > 0 and missed target
+    d = d[(d["Targeted Visits"] > 0) & (d["Completed"] < d["Targeted Visits"])].copy()
+    if d.empty:
+        st.success(f"✅ {title}: All mentors have completed 100% targets (for mentors with target > 0).")
+        return None
+
+    # Add location columns only if they are not already in group_cols
+    loc_cols = []
+    if "Block Name" in d.columns and "Block Name" not in group_cols:
+        loc_cols.append("Block Name")
+    if "Cluster Name" in d.columns and "Cluster Name" not in group_cols:
+        loc_cols.append("Cluster Name")
+
+    # De-duplicate group columns (bulletproof)
+    gcols = group_cols + loc_cols + ["Role Name", "Employee Name"]
+    gcols = list(dict.fromkeys(gcols))  # preserve order, remove duplicates
+
+    ex = d.groupby(gcols, dropna=False).agg(
+        Target_Visit=("Targeted Visits", "sum"),
+        Completed_Visit=("Completed", "sum"),
+    ).reset_index()
+
+    ex["Pending Visits"] = (ex["Target_Visit"] - ex["Completed_Visit"]).clip(lower=0)
+    ex["% Completion"] = np.where(ex["Target_Visit"] > 0, (ex["Completed_Visit"] / ex["Target_Visit"]) * 100, np.nan)
+
+    # Sort worst-first
+    ex = ex.sort_values(["% Completion", "Pending Visits"], ascending=[True, False])
+
+    # KPIs
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Mentors not at 100%", int(ex["Employee Name"].nunique()))
+    k2.metric("Total pending visits", int(ex["Pending Visits"].sum()))
+    k3.metric("Median % completion", f"{ex['% Completion'].median():.1f}%")
+    k4.metric("Worst % completion", f"{ex['% Completion'].min():.1f}%")
+
+    st.markdown(f"### 🚨 {title}: Mentors NOT completing 100% target")
+    st.caption("Sorted worst-first: lowest % completion, then highest pending visits.")
+
+    # Display columns (no Employee Code)
+    show_cols = gcols + ["Target_Visit", "Completed_Visit", "Pending Visits", "% Completion"]
+    st.dataframe(style_pct_cols(ex[show_cols], ["% Completion"]), use_container_width=True)
+
+    return ex
 
 
 # ============================================================
@@ -206,7 +249,6 @@ with tab_state:
     )
     base = pd.DataFrame({"District Name": all_districts})
 
-    # Merge role-wide stats
     for r in DIST_ROLES:
         base = base.merge(agg_role_wide(dist, ["District Name"], r), on="District Name", how="left")
     for r in BLOCK_ROLES:
@@ -214,37 +256,28 @@ with tab_state:
     for r in CLUSTER_ROLES:
         base = base.merge(agg_role_wide(cluster, ["District Name"], r), on="District Name", how="left")
 
-    # Totals + mentor100%
     totals = overall_by_group(unified, ["District Name"])
     base = base.merge(totals, on="District Name", how="left")
 
-    # Rank and sort
     base = base.sort_values(["Total %", "District Name"], ascending=[False, True]).reset_index(drop=True)
     base.insert(0, "Rank", np.arange(1, len(base) + 1))
 
-    # Arrange columns in your format
     ordered_cols = ["Rank", "District Name"]
     for r in ["DPC", "DIET Principal", "DIET Academic", "APC", "BRCC", "BAC", "CAC"]:
         ordered_cols += [f"{r} Target", f"{r} Completed", f"{r} %"]
     ordered_cols += ["Total_Target", "Total_Completed", "Total %", "% of Mentors Completing 100% Mentoring Visit"]
 
     state_table = base[ordered_cols].copy()
-
-    # Pretty table
     pct_cols = [c for c in state_table.columns if c.endswith(" %") or c.endswith("%") or c == "Total %"]
     st.dataframe(style_pct_cols(state_table, pct_cols), use_container_width=True)
 
-    # Optional chart: Top 20
     top20 = state_table.sort_values("Total %", ascending=False).head(20)
     fig = px.bar(top20, x="District Name", y="Total %", title="Top 20 Districts by Total % Completion")
     fig.update_layout(height=420, xaxis_title="", yaxis_title="Total %")
     st.plotly_chart(fig, use_container_width=True)
 
     if enable_export:
-        to_excel_download(
-            {"State_District_Performance": state_table},
-            filename="state_district_performance.xlsx"
-        )
+        to_excel_download({"State_District_Performance": state_table}, filename="state_district_performance.xlsx")
 
 # ============================================================
 # 2) DISTRICT TAB
@@ -255,10 +288,6 @@ with tab_district:
     all_districts = sorted(cluster["District Name"].dropna().unique().tolist())
     sel_d = st.selectbox("Select District", options=all_districts)
 
-    # ---------------------------
-    # Table 1: Overall district performance
-    # (A) District mentors (DPC/DIET/APC)
-    # ---------------------------
     st.markdown("### 1) Overall District Performance")
 
     st.markdown("#### District Mentors (role-wise)")
@@ -280,10 +309,8 @@ with tab_district:
     dm_sum = dm_sum[dm_sum["District Mentors"].isin(DIST_ROLES)].copy()
     dm_sum = dm_sum.sort_values("% Completion", ascending=False)
     dm_sum = dm_sum.drop(columns=["Mentors", "Mentors100"])
-
     st.dataframe(style_pct_cols(dm_sum, ["% Completion", "% of Mentors Completing 100% Visits"]), use_container_width=True)
 
-    # (B) Block mentors combined rollup (BAC+BRCC+CAC)
     st.markdown("#### Block-wise Combined Mentors (BAC + BRCC + CAC)")
     blk = block[block["District Name"] == sel_d].copy()
     cac = cluster[cluster["District Name"] == sel_d].copy()
@@ -302,12 +329,8 @@ with tab_district:
     bsum["% Completion"] = np.where(bsum["Target_Visit"] > 0, (bsum["Completed_Visit"] / bsum["Target_Visit"]) * 100, np.nan)
     bsum["% of Mentors Completing 100% Visits"] = np.where(bsum["Mentors"] > 0, (bsum["Mentors100"] / bsum["Mentors"]) * 100, np.nan)
     bsum = bsum.drop(columns=["Mentors", "Mentors100"]).sort_values("% Completion", ascending=False)
-
     st.dataframe(style_pct_cols(bsum, ["% Completion", "% of Mentors Completing 100% Visits"]), use_container_width=True)
 
-    # ---------------------------
-    # Table 2: BRCC Compliance (Block-wise)
-    # ---------------------------
     st.markdown("### 2) BRCC Compliance (Block-wise)")
     brcc = block[(block["District Name"] == sel_d) & (block["Role Name"] == "BRCC")].copy()
     brcc_sum = brcc.groupby("Block Name", dropna=False).agg(
@@ -318,9 +341,6 @@ with tab_district:
     brcc_sum = brcc_sum.sort_values("% Completion", ascending=False)
     st.dataframe(style_pct_cols(brcc_sum, ["% Completion"]), use_container_width=True)
 
-    # ---------------------------
-    # Table 3: BAC Compliance (Block-wise)
-    # ---------------------------
     st.markdown("### 3) BAC Compliance (Block-wise)")
     bac = block[(block["District Name"] == sel_d) & (block["Role Name"] == "BAC")].copy()
     bac["is100"] = mentor_100_flag(bac)
@@ -336,9 +356,6 @@ with tab_district:
     bac_sum = bac_sum.drop(columns=["Mentors", "Mentors100"]).sort_values("% Completion", ascending=False)
     st.dataframe(style_pct_cols(bac_sum, ["% Completion", "% of Mentors Completing 100% Visits"]), use_container_width=True)
 
-    # ---------------------------
-    # Table 4: CAC Compliance (Block-wise)
-    # ---------------------------
     st.markdown("### 4) CAC Compliance (Block-wise)")
     cac_d = cluster[cluster["District Name"] == sel_d].copy()
     cac_d["is100"] = mentor_100_flag(cac_d)
@@ -354,17 +371,37 @@ with tab_district:
     cac_sum = cac_sum.drop(columns=["Mentors", "Mentors100"]).sort_values("% Completion", ascending=False)
     st.dataframe(style_pct_cols(cac_sum, ["% Completion", "% of Mentors Completing 100% Visits"]), use_container_width=True)
 
+    # Mentor Exception List (District) - includes Block/Cluster where available
+    st.markdown("---")
+    st.subheader("Mentor Exception List (District)")
+
+    district_all = pd.concat(
+        [
+            dist[dist["District Name"] == sel_d],
+            block[block["District Name"] == sel_d],
+            cluster[cluster["District Name"] == sel_d],
+        ],
+        ignore_index=True
+    )
+
+    ex_d = mentor_exception_table(
+        df=district_all,
+        group_cols=["District Name"],
+        title=f"{sel_d}"
+    )
+
     if enable_export:
-        to_excel_download(
-            {
-                "District_Mentors": dm_sum,
-                "Block_Combined_Mentors": bsum,
-                "BRCC_Compliance": brcc_sum,
-                "BAC_Compliance": bac_sum,
-                "CAC_Compliance": cac_sum,
-            },
-            filename=f"{sel_d}_district_drilldown.xlsx"
-        )
+        export_sheets = {
+            "District_Mentors": dm_sum,
+            "Block_Combined_Mentors": bsum,
+            "BRCC_Compliance": brcc_sum,
+            "BAC_Compliance": bac_sum,
+            "CAC_Compliance": cac_sum,
+        }
+        if ex_d is not None:
+            export_sheets["Mentor_Exceptions"] = ex_d
+
+        to_excel_download(export_sheets, filename=f"{sel_d}_district_drilldown.xlsx")
 
 # ============================================================
 # 3) BLOCK TAB
@@ -381,9 +418,6 @@ with tab_block:
 
     cb = cluster[(cluster["District Name"] == sel_d) & (cluster["Block Name"] == sel_b)].copy()
 
-    # ---------------------------
-    # Table 1: Cluster Compliance
-    # ---------------------------
     st.markdown("### 1) Cluster Compliance")
     clus = cb.groupby("Cluster Name", dropna=False).agg(
         Target_Visit=("Targeted Visits", "sum"),
@@ -393,9 +427,6 @@ with tab_block:
     clus = clus.sort_values("% Completion", ascending=False)
     st.dataframe(style_pct_cols(clus, ["% Completion"]), use_container_width=True)
 
-    # ---------------------------
-    # Table 2: CAC Leaderboard
-    # ---------------------------
     st.markdown("### 2) CAC Leaderboard")
     lb = cb.groupby(["Employee Name", "Cluster Name"], dropna=False).agg(
         Target_Visit=("Targeted Visits", "sum"),
@@ -404,16 +435,34 @@ with tab_block:
     lb["% Completion"] = np.where(lb["Target_Visit"] > 0, (lb["Completed_Visit"] / lb["Target_Visit"]) * 100, np.nan)
     lb = lb.sort_values("% Completion", ascending=False)
     lb = lb.rename(columns={"Employee Name": "Mentor Name"})
-
     st.dataframe(style_pct_cols(lb, ["% Completion"]), use_container_width=True)
 
-    if enable_export:
-        to_excel_download(
-            {
-                "Cluster_Compliance": clus,
-                "CAC_Leaderboard": lb,
-            },
-            filename=f"{sel_d}_{sel_b}_block_drilldown.xlsx"
-        )
+    # Mentor Exception List (Block) - includes Cluster Name, no duplicate columns
+    st.markdown("---")
+    st.subheader("Mentor Exception List (Block)")
 
-st.success("✅ Updated dashboard code loaded. If you still see an older UI, stop Streamlit (Ctrl+C) and run again.")
+    block_all = pd.concat(
+        [
+            block[(block["District Name"] == sel_d) & (block["Block Name"] == sel_b)],
+            cluster[(cluster["District Name"] == sel_d) & (cluster["Block Name"] == sel_b)],
+        ],
+        ignore_index=True
+    )
+
+    ex_b = mentor_exception_table(
+        df=block_all,
+        group_cols=["District Name", "Block Name"],
+        title=f"{sel_d} | {sel_b}"
+    )
+
+    if enable_export:
+        export_sheets = {
+            "Cluster_Compliance": clus,
+            "CAC_Leaderboard": lb,
+        }
+        if ex_b is not None:
+            export_sheets["Mentor_Exceptions"] = ex_b
+
+        to_excel_download(export_sheets, filename=f"{sel_d}_{sel_b}_block_drilldown.xlsx")
+
+st.success("✅ Updated dashboard code loaded (fixed duplicate 'Block Name' error in exception tables).")
